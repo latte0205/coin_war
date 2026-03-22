@@ -26,6 +26,10 @@ class Fetcher:
             logger.warning(f"yfinance returned empty data for {ticker}")
             return None
 
+        # Flatten MultiIndex columns returned by newer yfinance versions
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+
         df.index = pd.to_datetime(df.index)
         self._cache.save(ticker, df)
         return df
