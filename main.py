@@ -84,8 +84,10 @@ def cmd_scan(args, cfg):
 
 def cmd_backtest(args, cfg):
     from data.fetcher import Fetcher
+    from data.bulk_download import load_chips_from_cache
     from backtest.engine import BacktestEngine
     from backtest.report import BacktestReport
+    from signals.chips import ChipsSignals
 
     fetcher = Fetcher(cache_dir=cfg["data"]["cache_dir"])
     tickers = [args.ticker] if args.ticker else cfg["watchlist"]
@@ -99,9 +101,14 @@ def cmd_backtest(args, cfg):
             continue
         if args.start:
             df = df[df.index >= args.start]
-        stats = engine.run(df, ticker=ticker)
+
+        # Load chips from bulk cache if available
+        chips_cache = load_chips_from_cache(ticker)
+
+        stats = engine.run(df, ticker=ticker, chips_cache=chips_cache)
         path = reporter.save(ticker, stats)
-        console.print(f"[cyan]{ticker}[/cyan] 報酬率: [bold]{stats['total_return']*100:.2f}%[/bold] "
+        chips_note = " [有籌碼]" if chips_cache else " [無籌碼]"
+        console.print(f"[cyan]{ticker}[/cyan]{chips_note} 報酬率: [bold]{stats['total_return']*100:.2f}%[/bold] "
                       f"勝率: {stats['win_rate']*100:.1f}% 報告: {path}")
 
 
@@ -153,6 +160,48 @@ def cmd_paper(args, cfg):
         console.print(f"[yellow]{ticker} 訊號不足（{cs.total}/25），不進場[/yellow]")
 
 
+def cmd_download(args, cfg):
+    from data.stock_list import get_all_stock_ids
+    from data.bulk_download import (
+        download_all_prices, download_chips_batch,
+        download_status, _load_progress
+    )
+    from data.cache import Cache
+
+    token = os.getenv("FINMIND_TOKEN", "")
+    cache = Cache(cache_dir=cfg["data"]["cache_dir"])
+    max_req = cfg["data"]["max_api_requests_per_day"]
+
+    console.print("[bold cyan]取得全台上市股票清單...[/bold cyan]")
+    stock_ids = get_all_stock_ids(finmind_token=token)
+    console.print(f"共 {len(stock_ids)} 支股票")
+
+    if args.status:
+        download_status(stock_ids)
+        return
+
+    if args.reset:
+        from pathlib import Path
+        p = Path("cache/download_progress.json")
+        if p.exists():
+            p.unlink()
+        console.print("[yellow]進度已重設[/yellow]")
+
+    if not args.chips_only:
+        download_all_prices(stock_ids, cache, force=args.reset)
+
+    if not args.price_only:
+        if not token:
+            console.print("[yellow]警告：未設定 FINMIND_TOKEN，跳過籌碼下載[/yellow]")
+        else:
+            download_chips_batch(
+                stock_ids, finmind_token=token,
+                max_requests=max_req, force=args.reset
+            )
+
+    download_status(stock_ids)
+
+
 def cmd_positions(args, cfg):
     broker = _get_paper_broker(cfg)
     positions = broker.get_positions()
@@ -186,6 +235,12 @@ def main():
 
     sub.add_parser("positions", help="顯示持倉")
 
+    dl = sub.add_parser("download", help="批次下載全台股歷史資料")
+    dl.add_argument("--price-only", action="store_true", help="只下載價格資料")
+    dl.add_argument("--chips-only", action="store_true", help="只下載籌碼資料")
+    dl.add_argument("--reset", action="store_true", help="重設進度，重新下載")
+    dl.add_argument("--status", action="store_true", help="顯示下載進度")
+
     args = parser.parse_args()
     cfg = load_config()
 
@@ -197,6 +252,8 @@ def main():
         cmd_paper(args, cfg)
     elif args.command == "positions":
         cmd_positions(args, cfg)
+    elif args.command == "download":
+        cmd_download(args, cfg)
     else:
         parser.print_help()
 

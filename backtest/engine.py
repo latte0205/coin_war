@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from signals.technical import TechnicalSignals
 from signals.volume import VolumeSignals
+from signals.chips import ChipsSignals
 from signals.composite import CompositeScore, SignalStrength
 from strategy.entry import EntryFilter
 from strategy.exit import ExitSignal
@@ -19,12 +20,28 @@ DEFAULT_CONFIG = {
 }
 
 
+def _chips_score_for_window(chips_cache: dict, window: pd.DataFrame) -> int | None:
+    """Return chips score filtered to current window date, or None if insufficient data."""
+    if chips_cache is None:
+        return None
+    current_date = window.index[-1].strftime("%Y-%m-%d")
+    inst = chips_cache["institutional"]
+    margin = chips_cache["margin"]
+    inst_w = inst[inst["date"] <= current_date]
+    margin_w = margin[margin["date"] <= current_date] if "date" in margin.columns else margin[margin.index <= current_date]
+    if inst_w.empty or margin_w.empty:
+        return None
+    cs = ChipsSignals(inst_df=inst_w, margin_df=margin_w, price_df=window)
+    score, _ = cs.score()
+    return score
+
+
 class BacktestEngine:
     def __init__(self, initial_cash: float = 1_000_000, config: dict = None):
         self._cash = initial_cash
         self._cfg = config or DEFAULT_CONFIG
 
-    def run(self, df: pd.DataFrame, ticker: str) -> dict:
+    def run(self, df: pd.DataFrame, ticker: str, chips_cache: dict | None = None) -> dict:
         warmup = 90
         if len(df) < warmup:
             return {"error": "insufficient_data"}
@@ -46,7 +63,8 @@ class BacktestEngine:
                 t_score, _ = tech.score()
                 vol = VolumeSignals(window)
                 v_score, _ = vol.score()
-                cs = CompositeScore(tech_score=t_score, vol_score=v_score, chips_score=None)
+                c_score = _chips_score_for_window(chips_cache, window)
+                cs = CompositeScore(tech_score=t_score, vol_score=v_score, chips_score=c_score)
                 ef = EntryFilter(config=self._cfg)
                 if ef.should_enter(cs, window):
                     fill = close * (1 + 0.005 + SLIPPAGE)
@@ -66,7 +84,8 @@ class BacktestEngine:
                 t_score, _ = tech.score()
                 vol = VolumeSignals(window)
                 v_score, _ = vol.score()
-                cs = CompositeScore(tech_score=t_score, vol_score=v_score, chips_score=None)
+                c_score = _chips_score_for_window(chips_cache, window)
+                cs = CompositeScore(tech_score=t_score, vol_score=v_score, chips_score=c_score)
                 action = es.check(close, i - entry_day, cs.total)
                 if action["exit"]:
                     if action["reason"] == "take_profit_1":
