@@ -1,0 +1,34 @@
+watchlist:
+  - "2330"  # 台積電
+  - "2317"  # 鴻海
+  - "2454"  # 聯發科
+  - "2382"  # 廣達
+  - "3711"  # 日月光投控
+  - "2308"  # 台達電
+  - "2881"  # 富邦金
+  - "2882"  # 國泰金
+  - "2886"  # 兆豐金
+  - "1301"  # 台塑
+
+thresholds:
+  strong_signal: 14
+  watch_signal: 10
+  exit_signal: 6
+  volume_filter_ratio: 0.8
+
+position:
+  size_pct: 0.10
+  max_positions: 8
+  max_exposure_pct: 0.80
+
+exit:
+  stop_loss_pct: -0.07
+  take_profit_1_pct: 0.15
+  take_profit_1_qty_pct: 0.50
+  take_profit_2_pct: 0.20
+  time_stop_days: 20
+
+data:
+  cache_dir: "cache/"
+  max_api_requests_per_day: 600
+  warmup_days: 90
