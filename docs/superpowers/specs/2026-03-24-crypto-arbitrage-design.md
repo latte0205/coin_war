@@ -103,7 +103,8 @@ class BaseExchange(ABC):
     # Cancels WebSocket tasks; called on graceful shutdown or after 5 reconnect failures
 
     def taker_fee(self) -> float: ...     # returns effective fee (override or default)
-    def withdraw_fee(self, asset: str) -> float: ...  # reserved, future use
+    def withdraw_fee(self, asset: str) -> float:
+        return 0.0  # not abstract; adapters may leave this as the default — not yet used
 
     def current_price(self, pair: str) -> tuple[float, float] | None:
         # Returns (best_ask, best_bid) from internal cache, or None if no data yet
@@ -128,6 +129,7 @@ class ExecutionResult:
     opportunity: "ArbitrageOpportunity"
     buy_result: OrderResult
     sell_result: OrderResult
+    amount_usdt: float         # trade size used (carried here for CSV logging)
     simulated: bool            # True if dry_run mode
     executed_at: datetime      # datetime.now(timezone.utc)
     realized_pnl_usdt: float   # computed for both real and dry_run; 0.0 if either leg failed
@@ -192,19 +194,23 @@ Both directions (A→B and B→A) evaluated on every orderbook update.
 
 Manages WebSocket subscriptions for all enabled exchanges.
 
+**Scanner-to-monitor communication:** scanner uses an `asyncio.Queue[ArbitrageOpportunity]` passed in at construction. `monitor.py` creates the queue, passes it to `Scanner`, and calls `await queue.get()` in its main loop.
+
 **Startup:**
 1. `get_tradable_pairs()` on all enabled exchanges → compute intersection
 2. Subscribe all exchanges to common pairs via `subscribe_orderbook`
-3. Maintain `prices[exchange_name][pair] = (best_ask, best_bid, updated_at)`
+3. Maintain `prices[exchange_name][pair] = (best_ask, best_bid, updated_at: datetime UTC)`
 
-**Price staleness:** prices older than `price_staleness_seconds` (config) are excluded from spread checks.
+**Price staleness:** prices older than `price_staleness_seconds` (config) are excluded from spread checks. Compare: `(datetime.now(timezone.utc) - updated_at).total_seconds() > price_staleness_seconds`.
+
+**Cooldown dict** is owned by scanner: `_cooldowns: dict[tuple, datetime]` keyed on `(pair, buy_exchange, sell_exchange)`. `monitor.py` calls `scanner.set_cooldown(pair, buy_ex, sell_ex)` after each execution.
 
 **On each callback:**
-1. Update `prices[exchange_name][pair]`
+1. Update `prices[exchange_name][pair]` with `(ask, bid, datetime.now(timezone.utc))`
 2. For each pair with ≥ 2 fresh prices: evaluate both directions
-3. If spread ≥ `min_spread_pct` and not on cooldown for `(pair, buy_ex, sell_ex)`: emit `ArbitrageOpportunity`
+3. If spread ≥ `min_spread_pct` and not on cooldown: `await queue.put(opportunity)`
 
-Cooldown keyed on `(pair, buy_exchange, sell_exchange)` triplet — both directions are independent.
+Both directions are independent cooldowns.
 
 ### `position_sizer.py`
 
@@ -244,8 +250,7 @@ Config read path: `cfg["position"]["max_usdt"]` etc. — `cfg` is the crypto con
 
 ```python
 async def execute(opportunity: ArbitrageOpportunity,
-                  buy_ex: BaseExchange,
-                  sell_ex: BaseExchange,
+                  buy_ex: BaseExchange, sell_ex: BaseExchange,
                   amount_usdt: float,
                   dry_run: bool = False) -> ExecutionResult:
     now = datetime.now(timezone.utc)
@@ -285,7 +290,8 @@ async def execute(opportunity: ArbitrageOpportunity,
 
     return ExecutionResult(
         opportunity=opportunity, buy_result=buy_result, sell_result=sell_result,
-        simulated=dry_run, executed_at=now, realized_pnl_usdt=pnl, success=success)
+        amount_usdt=amount_usdt, simulated=dry_run, executed_at=now,
+        realized_pnl_usdt=pnl, success=success)
 ```
 
 `realized_pnl_usdt` is computed for both real and dry_run successful trades (useful for paper trading P&L tracking). It is `0.0` only when either leg failed.
@@ -303,16 +309,17 @@ Receives `crypto_cfg` — the dict loaded from `crypto_settings.yaml`, not the m
 
 **Main loop:**
 1. Initialise adapters: `BinanceExchange(crypto_cfg["exchanges"]["binance"])`, etc.
-2. Start balance refresh background task
-3. Start scanner subscriptions
-4. On each `ArbitrageOpportunity`:
+2. Create `queue: asyncio.Queue[ArbitrageOpportunity]`; construct `Scanner(exchanges, queue, crypto_cfg)`
+3. Start balance refresh background task
+4. Start `scanner.run()` as a background `asyncio.Task`
+5. Loop: `opp = await queue.get()`
    a. Look up cached USDT balance for buy exchange
-   b. `amount_usdt = position_sizer.calculate_amount(balance, crypto_cfg)` — passes crypto_cfg
+   b. `amount_usdt = position_sizer.calculate_amount(balance, crypto_cfg)`
    c. If `amount_usdt > 0`: `result = await executor.execute(opp, ..., amount_usdt, dry_run)`
-   d. Append `result` to `reports/arb_log.csv` (using `pandas.DataFrame.to_csv(mode='a')`)
-   e. Set cooldown for `(pair, buy_ex, sell_ex)` triplet
-   f. Update cached balance (optimistic subtraction)
-5. On Ctrl-C: await `ex.close()` for all adapters, then exit
+   d. Append `result` to `reports/arb_log.csv` (pandas, `mode='a'`, `header=not file_exists`)
+   e. `scanner.set_cooldown(opp.pair, opp.buy_exchange, opp.sell_exchange)`
+   f. Optimistically subtract `amount_usdt` from cached buy-exchange balance
+6. On Ctrl-C (`asyncio.CancelledError`): await `ex.close()` for all adapters, then exit
 
 **Rich console:** Refreshes every second — live opportunity table, cumulative P&L, per-exchange balance.
 
@@ -355,7 +362,10 @@ synthetic_bid = last_price * 0.9998
 ```
 Backtest reports display a disclaimer when tick-proxy data is used.
 
-Stored as `cache/crypto/<exchange>/<pair_normalized>/<YYYY-MM-DD>.parquet`
+**`pair_normalized` format:** canonical pair with `/` replaced by `_`, uppercase. e.g. `BTC/USDT` → `BTC_USDT`.
+Stored as `cache/crypto/<exchange>/BTC_USDT/<YYYY-MM-DD>.parquet`
+
+**`pair=None` behaviour:** if `--pair` is omitted, `download()` downloads all common pairs (intersection of enabled exchanges). `run_backtest()` with `pair=None` also runs all common pairs sequentially.
 
 CLI: `python main.py arb --download-data --pair BTC/USDT --days 90`
 
