@@ -370,15 +370,21 @@ async def start(crypto_cfg: dict, dry_run: bool) -> None:
     scanner = Scanner(exchanges, queue, crypto_cfg)
     balances: dict[str, float] = {name: await ex.get_balance("USDT")
                                   for name, ex in exchanges.items()}
-    asyncio.create_task(scanner.run())
-    asyncio.create_task(_refresh_balances(exchanges, balances, crypto_cfg))
-    asyncio.create_task(_live_display(exchanges, balances))
+    scanner_task = asyncio.create_task(scanner.run())
+    refresh_task = asyncio.create_task(_refresh_balances(exchanges, balances, crypto_cfg))
+    display_task = asyncio.create_task(_live_display(exchanges, balances))
+    # _refresh_balances: every balance_refresh_seconds, call get_balance("USDT") on each exchange
+    # _live_display: every 1s, update Rich live table with opportunities, P&L, balances
+    # _append_to_csv(result, path): pd.DataFrame([row_dict]).to_csv(path, mode='a',
+    #   header=not Path(path).exists(), index=False)  — single-process assumption
 
     try:
         while True:
             opp = await queue.get()
             if opp.buy_exchange not in exchanges or opp.sell_exchange not in exchanges:
-                continue  # one or both adapters were removed since opportunity was enqueued
+                continue  # one or both adapters removed since opportunity was enqueued
+            # Note: sell-side base currency inventory is not checked pre-trade (v1 limitation)
+            # If sell leg fails due to insufficient inventory, ExecutionResult.success=False
             amount_usdt = position_sizer.calculate_amount(
                 balances.get(opp.buy_exchange, 0.0), crypto_cfg)
             if amount_usdt == 0.0:
@@ -387,23 +393,16 @@ async def start(crypto_cfg: dict, dry_run: bool) -> None:
                 opp, exchanges[opp.buy_exchange], exchanges[opp.sell_exchange],
                 amount_usdt, dry_run)
             _append_to_csv(result, "reports/arb_log.csv")
-            # _append_to_csv: module-private helper in monitor.py
-            # def _append_to_csv(result: ExecutionResult, path: str) -> None:
-            #     row = {field: getattr(result, field) ... + buy/sell result fields}
-            #     pd.DataFrame([row]).to_csv(path, mode='a', header=not Path(path).exists(), index=False)
             scanner.set_cooldown(opp.pair, opp.buy_exchange, opp.sell_exchange)
             balances[opp.buy_exchange] = max(0.0, balances[opp.buy_exchange] - amount_usdt)
-            # max(0.0,...) prevents balance going negative if multiple opportunities
-            # from the queue were already waiting before this trade executed
+            # max(0.0,...) prevents negative cache if multiple opportunities queued before trade
     except asyncio.CancelledError:
-        # Cancel background tasks first, then close adapters
-        for task in [refresh_task, display_task, scanner_task]:
+        for task in [scanner_task, refresh_task, display_task]:
             task.cancel()
             try: await task
             except asyncio.CancelledError: pass
         for ex in exchanges.values():
             await ex.close()
-        # store task handles: scanner_task = asyncio.create_task(scanner.run()), etc.
 ```
 
 **Rich console:** Refreshes every second — live opportunity table, cumulative P&L, per-exchange balance.
