@@ -377,8 +377,8 @@ async def start(crypto_cfg: dict, dry_run: bool) -> None:
     try:
         while True:
             opp = await queue.get()
-            if opp.buy_exchange not in exchanges:
-                continue  # adapter was removed
+            if opp.buy_exchange not in exchanges or opp.sell_exchange not in exchanges:
+                continue  # one or both adapters were removed since opportunity was enqueued
             amount_usdt = position_sizer.calculate_amount(
                 balances.get(opp.buy_exchange, 0.0), crypto_cfg)
             if amount_usdt == 0.0:
@@ -387,13 +387,23 @@ async def start(crypto_cfg: dict, dry_run: bool) -> None:
                 opp, exchanges[opp.buy_exchange], exchanges[opp.sell_exchange],
                 amount_usdt, dry_run)
             _append_to_csv(result, "reports/arb_log.csv")
+            # _append_to_csv: module-private helper in monitor.py
+            # def _append_to_csv(result: ExecutionResult, path: str) -> None:
+            #     row = {field: getattr(result, field) ... + buy/sell result fields}
+            #     pd.DataFrame([row]).to_csv(path, mode='a', header=not Path(path).exists(), index=False)
             scanner.set_cooldown(opp.pair, opp.buy_exchange, opp.sell_exchange)
             balances[opp.buy_exchange] = max(0.0, balances[opp.buy_exchange] - amount_usdt)
             # max(0.0,...) prevents balance going negative if multiple opportunities
             # from the queue were already waiting before this trade executed
     except asyncio.CancelledError:
+        # Cancel background tasks first, then close adapters
+        for task in [refresh_task, display_task, scanner_task]:
+            task.cancel()
+            try: await task
+            except asyncio.CancelledError: pass
         for ex in exchanges.values():
             await ex.close()
+        # store task handles: scanner_task = asyncio.create_task(scanner.run()), etc.
 ```
 
 **Rich console:** Refreshes every second — live opportunity table, cumulative P&L, per-exchange balance.
@@ -474,7 +484,11 @@ Replays downloaded data to simulate arbitrage. The replayer uses historical `tim
 2. For non-Binance: apply synthetic bid/ask from tick `last_price`
 3. Merge all updates into single time-sorted event stream (key: `timestamp_ms`)
 4. Maintain `(ask, bid, updated_at)` state per exchange. **Staleness check uses the current event's `timestamp_ms` as "now"**, not `datetime.now()`. A price is stale if `(current_event_ts_ms - updated_at_ms) > price_staleness_seconds * 1000`.
-5. On each event: `calculate_spread()` for both directions
+5. On each event: call `calculate_spread()` for both directions. The replayer does **not** instantiate real exchange adapters. Instead it reads fee rates from config:
+   ```python
+   fee = crypto_cfg["exchanges"][exchange_name].get("taker_fee_override") or DEFAULT_FEES[exchange_name]
+   ```
+   and passes a lightweight `_FeeAdapter(name, fee)` stub that only implements `taker_fee()` and `name`.
 6. If spread ≥ threshold and not on cooldown:
    - Apply slippage **before** constructing `ArbitrageOpportunity`:
      ```python
@@ -628,7 +642,7 @@ Backtest mode:
   downloader.py → cache/crypto/<exchange>/<pair>/<date>.parquet
   → replayer.py (time-sorted events, synthetic bid/ask, slippage applied before ArbitrageOpportunity)
   → executor.execute(..., dry_run=True) → simulated ExecutionResult list
-  → arb_report.py → reports/backtest_arb_<pair>_<date>.html
+  → arb_report.py → reports/arb_backtest_log.html
 ```
 
 ---
