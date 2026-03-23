@@ -58,6 +58,8 @@ from collections.abc import Callable
 
 OrderbookCallback = Callable[[str, str, float, float], None]
 # args: (exchange_name: str, pair: str, best_ask: float, best_bid: float)
+# Return type is None (synchronous). Scanner's _on_update uses queue.put_nowait()
+# (not await queue.put()) so the callback stays synchronous and non-blocking.
 ```
 
 **`place_market_order` sell-side semantics:** `amount_usdt` is always quote-currency (USDT) for both sides. Each adapter internally converts to base currency using `self._price_cache`:
@@ -109,7 +111,9 @@ class BaseExchange(ABC):
 
     @abstractmethod
     async def close(self) -> None: ...
-    # Cancels WebSocket background task; called on graceful shutdown or after 5 retries
+    # Cancels WebSocket background task; called on graceful shutdown or after 5 retries.
+    # If the event loop is being torn down, avoid additional async I/O in close() —
+    # cancel the task and let the WebSocket connection drop without a clean close frame.
 
     def taker_fee(self) -> float:
         return self._fee  # set by subclass __init__
@@ -226,6 +230,11 @@ async def run(self) -> None:
 def set_cooldown(self, pair: str, buy_exchange: str, sell_exchange: str) -> None:
     # Records current time for (pair, buy_exchange, sell_exchange) key (all strings)
     self._cooldowns[(pair, buy_exchange, sell_exchange)] = datetime.now(timezone.utc)
+
+def remove_exchange(self, name: str) -> None:
+    # Removes exchange from internal state; called by monitor when adapter goes down
+    self._prices.pop(name, None)
+    # Re-compute common pairs on next _on_update cycle (any pair with < 2 exchanges drops out)
 ```
 
 **Internal state:**
@@ -240,10 +249,10 @@ _cooldowns: dict[tuple[str, str, str], datetime]
 2. `subscribe_orderbook(common_pairs, self._on_update)` on each adapter (each starts its own background task)
 3. Await `asyncio.Event()` forever (or until cancelled)
 
-**`_on_update` callback:**
+**`_on_update` callback (synchronous — called by adapter directly):**
 1. Update `_prices[exchange_name][pair]` with `(ask, bid, datetime.now(timezone.utc))`
 2. For each pair where ≥ 2 exchanges have prices with age ≤ `price_staleness_seconds`: evaluate both directions
-3. If spread ≥ `min_spread_pct` and not on cooldown: `await queue.put(opportunity)`
+3. If spread ≥ `min_spread_pct` and not on cooldown: `queue.put_nowait(opportunity)` (synchronous, non-blocking)
 
 **Adapter availability:** When an adapter calls `close()` after exhausting retries, `monitor.py`'s active exchange set (a `dict[str, BaseExchange]`) is updated by removing that adapter. `Scanner` detects this via an async notification: `monitor.py` calls `scanner.remove_exchange(name: str)` which removes the adapter from `_prices` and re-computes the common pair intersection.
 
@@ -379,7 +388,9 @@ async def start(crypto_cfg: dict, dry_run: bool) -> None:
                 amount_usdt, dry_run)
             _append_to_csv(result, "reports/arb_log.csv")
             scanner.set_cooldown(opp.pair, opp.buy_exchange, opp.sell_exchange)
-            balances[opp.buy_exchange] -= amount_usdt  # optimistic update
+            balances[opp.buy_exchange] = max(0.0, balances[opp.buy_exchange] - amount_usdt)
+            # max(0.0,...) prevents balance going negative if multiple opportunities
+            # from the queue were already waiting before this trade executed
     except asyncio.CancelledError:
         for ex in exchanges.values():
             await ex.close()
@@ -389,7 +400,7 @@ async def start(crypto_cfg: dict, dry_run: bool) -> None:
 
 ### `arb_log.csv` schema
 
-Written with `pandas.DataFrame.to_csv(mode='a', header=not file_exists)`. One row per `ExecutionResult`.
+Written with `pandas.DataFrame.to_csv(mode='a', header=not Path(log_path).exists())`. One row per `ExecutionResult`.
 
 | Column | Type | Notes |
 |--------|------|-------|
@@ -462,7 +473,7 @@ Replays downloaded data to simulate arbitrage. The replayer uses historical `tim
 1. Load parquet data for both exchanges for the date range
 2. For non-Binance: apply synthetic bid/ask from tick `last_price`
 3. Merge all updates into single time-sorted event stream (key: `timestamp_ms`)
-4. Maintain `(ask, bid, updated_at)` state per exchange; apply same staleness check
+4. Maintain `(ask, bid, updated_at)` state per exchange. **Staleness check uses the current event's `timestamp_ms` as "now"**, not `datetime.now()`. A price is stale if `(current_event_ts_ms - updated_at_ms) > price_staleness_seconds * 1000`.
 5. On each event: `calculate_spread()` for both directions
 6. If spread ≥ threshold and not on cooldown:
    - Apply slippage **before** constructing `ArbitrageOpportunity`:
@@ -476,7 +487,8 @@ Replays downloaded data to simulate arbitrage. The replayer uses historical `tim
 
 ### `backtest/arb_report.py`
 
-`generate_report(log_path: str) -> str` — reads `arb_log.csv`, generates HTML, returns output path.
+`generate_report(log_path: str) -> str` — reads the given CSV, generates HTML, returns the output path.
+Output path: `log_path` with `.csv` replaced by `.html` (e.g. `reports/arb_log.html`, `reports/arb_backtest_log.html`).
 (Named `generate_report`, not `print_report` — it writes a file, not stdout.)
 
 Called from `cmd_arb` as: `path = generate_report("reports/arb_log.csv"); console.print(path)`
@@ -563,17 +575,22 @@ def cmd_arb(args, _main_cfg):  # _main_cfg unused, crypto has its own config
         asyncio.run(download(crypto_cfg, pair=args.pair, days=args.days))
     elif args.report:
         from crypto.backtest.arb_report import generate_report
-        path = generate_report("reports/arb_log.csv")
+        path = generate_report("reports/arb_log.csv")   # live trading log
         console.print(f"報告：{path}")
+    elif args.backtest_report:
+        from crypto.backtest.arb_report import generate_report
+        path = generate_report("reports/arb_backtest_log.csv")  # backtest log
+        console.print(f"回測報告：{path}")
 
 # In main():
 arb = sub.add_parser("arb", help="加密貨幣跨所套利（搬磚）")
 mode = arb.add_mutually_exclusive_group()
-mode.add_argument("--run",           action="store_true", help="全自動真實下單")
-mode.add_argument("--dry-run",       action="store_true", help="即時 Paper Trading（不下單）")
-mode.add_argument("--backtest",      action="store_true", help="歷史回測")
-mode.add_argument("--download-data", action="store_true", help="下載歷史 L2 資料")
-mode.add_argument("--report",        action="store_true", help="顯示歷史套利紀錄")
+mode.add_argument("--run",              action="store_true", help="全自動真實下單")
+mode.add_argument("--dry-run",         action="store_true", help="即時 Paper Trading（不下單）")
+mode.add_argument("--backtest",        action="store_true", help="歷史回測")
+mode.add_argument("--download-data",   action="store_true", help="下載歷史 L2 資料")
+mode.add_argument("--report",          action="store_true", help="顯示即時套利歷史報告")
+mode.add_argument("--backtest-report", action="store_true", help="顯示回測報告")
 arb.add_argument("--pair",  default=None, help="指定幣對（如 BTC/USDT）")
 arb.add_argument("--start", default=None, help="回測起始日期 YYYY-MM-DD")
 arb.add_argument("--end",   default=None, help="回測結束日期 YYYY-MM-DD")
