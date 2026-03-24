@@ -24,9 +24,17 @@ class CompositeScore:
         return self.tech_score + self.vol_score + (self.chips_score or 0)
 
     @property
+    def _max_score(self) -> int:
+        return 25 if self.chips_available else 15
+
+    @property
     def strength(self) -> SignalStrength:
-        if self.total >= 14:
+        # Scale thresholds proportionally when chips data is unavailable
+        scale = self._max_score / 25
+        strong_thresh = round(14 * scale)   # 14 with chips, 8 without
+        watch_thresh = round(10 * scale)    # 10 with chips, 6 without
+        if self.total >= strong_thresh:
             return SignalStrength.STRONG
-        elif self.total >= 10:
+        elif self.total >= watch_thresh:
             return SignalStrength.WATCH
         return SignalStrength.WEAK
