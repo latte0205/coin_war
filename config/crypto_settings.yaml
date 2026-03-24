@@ -1,0 +1,32 @@
+exchanges:
+  binance:
+    enabled: true
+    taker_fee_override: null
+  okx:
+    enabled: false
+    taker_fee_override: null
+  bybit:
+    enabled: false
+    taker_fee_override: null
+  max_exchange:
+    enabled: false
+    taker_fee_override: null
+  bitopro:
+    enabled: false
+    taker_fee_override: null
+
+arbitrage:
+  min_spread_pct: 0.005
+  cooldown_seconds: 30
+  price_staleness_seconds: 5
+
+position:
+  max_usdt: 1000
+  min_balance_pct: 0.05
+  min_usdt: 20
+
+monitor:
+  balance_refresh_seconds: 30
+
+backtest:
+  slippage_pct: 0.0005
