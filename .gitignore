@@ -6,3 +6,4 @@ __pycache__/
 reports/*.html
 reports/*.csv
 .pytest_cache/
+.worktrees/
