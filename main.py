@@ -219,6 +219,30 @@ def cmd_positions(args, cfg):
     console.print(f"可用現金：{broker.get_balance():,.0f} NTD")
 
 
+def load_crypto_config(path: str = "config/crypto_settings.yaml") -> dict:
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def cmd_arb(args, _main_cfg):
+    import asyncio
+    crypto_cfg = load_crypto_config()
+
+    if args.run or args.dry_run:
+        from crypto.monitor import start as arb_start
+        asyncio.run(arb_start(crypto_cfg, dry_run=args.dry_run))
+    elif args.backtest:
+        console.print("[yellow]Backtest mode not yet implemented (Plan B)[/yellow]")
+    elif args.download_data:
+        console.print("[yellow]Download data not yet implemented (Plan B)[/yellow]")
+    elif args.report:
+        console.print("[yellow]Report not yet implemented (Plan B)[/yellow]")
+    elif args.backtest_report:
+        console.print("[yellow]Backtest report not yet implemented (Plan B)[/yellow]")
+    else:
+        console.print("[yellow]請指定模式: --run / --dry-run / --backtest / --report[/yellow]")
+
+
 def main():
     parser = argparse.ArgumentParser(description="coin_war 台股訊號分析系統")
     sub = parser.add_subparsers(dest="command")
@@ -241,6 +265,19 @@ def main():
     dl.add_argument("--reset", action="store_true", help="重設進度，重新下載")
     dl.add_argument("--status", action="store_true", help="顯示下載進度")
 
+    arb = sub.add_parser("arb", help="加密貨幣跨所套利（搬磚）")
+    arb_mode = arb.add_mutually_exclusive_group()
+    arb_mode.add_argument("--run",           action="store_true", help="全自動真實下單")
+    arb_mode.add_argument("--dry-run",       action="store_true", dest="dry_run", help="即時 Paper Trading")
+    arb_mode.add_argument("--backtest",      action="store_true", help="歷史回測")
+    arb_mode.add_argument("--download-data", action="store_true", dest="download_data", help="下載歷史 L2 資料")
+    arb_mode.add_argument("--report",        action="store_true", help="即時套利報告")
+    arb_mode.add_argument("--backtest-report", action="store_true", dest="backtest_report", help="回測報告")
+    arb.add_argument("--pair",  default=None, help="指定幣對（如 BTC/USDT）")
+    arb.add_argument("--start", default=None, help="回測起始日期 YYYY-MM-DD")
+    arb.add_argument("--end",   default=None, help="回測結束日期 YYYY-MM-DD")
+    arb.add_argument("--days",  type=int, default=30, help="下載最近 N 天資料")
+
     args = parser.parse_args()
     cfg = load_config()
 
@@ -254,6 +291,8 @@ def main():
         cmd_positions(args, cfg)
     elif args.command == "download":
         cmd_download(args, cfg)
+    elif args.command == "arb":
+        cmd_arb(args, cfg)
     else:
         parser.print_help()
 
