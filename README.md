@@ -33,13 +33,35 @@ coinwar positions
 coinwar download
 ```
 
-## 環境變數
+## 環境變數設定
 
-在專案根目錄建立 `.env` 檔：
+複製範例檔並填入你的 API key：
+
+```bash
+cp .env.example .env
+```
+
+編輯 `.env`：
 
 ```
+# 台股資料（於 https://finmindtrade.com/ 免費申請）
 FINMIND_TOKEN=你的token
+
+# 加密貨幣交易所 API（依需求填入）
+BINANCE_API_KEY=
+BINANCE_API_SECRET=
+OKX_API_KEY=
+OKX_API_SECRET=
+OKX_PASSPHRASE=
+BYBIT_API_KEY=
+BYBIT_API_SECRET=
+MAX_API_KEY=
+MAX_API_SECRET=
+BITOPRO_API_KEY=
+BITOPRO_API_SECRET=
 ```
+
+> `.env` 已列入 `.gitignore`，不會被上傳到 GitHub。
 
 ## License
 
